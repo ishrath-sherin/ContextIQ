@@ -1,140 +1,260 @@
-from sentence_transformers import SentenceTransformer
+from pathlib import Path
+import json
 
-from services.search.vector_store import VectorStore
-from services.search.keyword_search import KeywordSearch
+import faiss
+import numpy as np
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
 
 
 class SearchService:
-    def __init__(self, documents):
-        self.documents = documents
+    def __init__(self):
+        self.model = SentenceTransformer("all-MiniLM-L6-v2")
 
-        self.embedding_model = SentenceTransformer(
-            "all-MiniLM-L6-v2"
-        )
+        self.index = None
+        self.chunks = []
+        self.bm25 = None
 
-        embeddings = self.embedding_model.encode(
-            documents,
+        self.index_dir = Path("data/index")
+        self.index_dir.mkdir(parents=True, exist_ok=True)
+
+        self.load_index()
+
+    def rebuild_bm25(self):
+        if not self.chunks:
+            self.bm25 = None
+            return
+
+        tokenized_documents = [
+            chunk["text"].lower().split()
+            for chunk in self.chunks
+        ]
+
+        self.bm25 = BM25Okapi(tokenized_documents)
+
+    def add_chunks(self, chunks):
+        if not chunks:
+            return
+
+        embeddings = self.model.encode(
+            [chunk["text"] for chunk in chunks],
             normalize_embeddings=True
         )
 
-        self.vector_store = VectorStore(
-            dimension=embeddings.shape[1]
+        embeddings = np.asarray(
+            embeddings,
+            dtype="float32"
         )
 
-        self.vector_store.add(embeddings)
+        if self.index is None:
+            dimension = embeddings.shape[1]
+            self.index = faiss.IndexFlatIP(dimension)
 
-        self.keyword_search = KeywordSearch(
-            documents
-        )
+        self.index.add(embeddings)
+        self.chunks.extend(chunks)
+
+        self.rebuild_bm25()
+        self.save_index()
 
     def search(self, query, top_k=5):
-        if not self.documents:
+        if not self.chunks or self.index is None:
             return []
 
-        # Create embedding for the user's query
-        query_embedding = self.embedding_model.encode(
+        query_embedding = self.model.encode(
             [query],
             normalize_embeddings=True
         )
 
-        # Retrieve semantic scores for all documents
-        semantic_scores, semantic_indices = (
-            self.vector_store.search(
-                query_embedding,
-                len(self.documents)
-            )
+        query_embedding = np.asarray(
+            query_embedding,
+            dtype="float32"
+        )
+
+        # Retrieve enough semantic candidates for hybrid ranking.
+        candidate_k = min(
+            max(top_k * 3, 10),
+            len(self.chunks)
+        )
+
+        semantic_scores, semantic_indices = self.index.search(
+            query_embedding,
+            candidate_k
         )
 
         semantic_scores = semantic_scores[0]
         semantic_indices = semantic_indices[0]
 
-        # Normalize semantic scores
-        min_semantic = float(min(semantic_scores))
-        max_semantic = float(max(semantic_scores))
-
-        if max_semantic > min_semantic:
-            normalized_semantic = {
-                int(index): float(
-                    (score - min_semantic)
-                    / (max_semantic - min_semantic)
-                )
-                for score, index in zip(
-                    semantic_scores,
-                    semantic_indices
-                )
-            }
-        else:
-            normalized_semantic = {
-                int(index): 0.0
-                for index in semantic_indices
-            }
-
-        # Retrieve BM25 scores
-        keyword_results = self.keyword_search.search(
-            query,
-            len(self.documents)
+        # Calculate BM25 scores for every chunk.
+        keyword_scores = np.zeros(
+            len(self.chunks),
+            dtype="float32"
         )
 
-        bm25_scores = [
-            score
-            for _, _, score in keyword_results
-        ]
-
-        min_bm25 = min(bm25_scores)
-        max_bm25 = max(bm25_scores)
-
-        normalized_bm25 = {}
-
-        if max_bm25 > min_bm25:
-            for document_index, _, score in keyword_results:
-                normalized_bm25[document_index] = (
-                    (score - min_bm25)
-                    / (max_bm25 - min_bm25)
-                )
-        else:
-            # No meaningful BM25 difference.
-            # If all scores are zero, there is no keyword signal.
-            for document_index, _, _ in keyword_results:
-                normalized_bm25[document_index] = 0.0
-
-        # Hybrid ranking
-        hybrid_results = []
-
-        for index, document in enumerate(self.documents):
-
-            semantic_score = normalized_semantic.get(
-                index,
-                0.0
+        if self.bm25 is not None:
+            keyword_scores = np.asarray(
+                self.bm25.get_scores(
+                    query.lower().split()
+                ),
+                dtype="float32"
             )
 
-            keyword_score = normalized_bm25.get(
-                index,
-                0.0
-            )
+        # Use the union of semantic candidates and keyword candidates.
+        semantic_candidates = {
+            int(index)
+            for index in semantic_indices
+            if index >= 0
+        }
 
-            hybrid_score = (
-                0.7 * semantic_score
-                + 0.3 * keyword_score
-            )
+        keyword_candidate_count = min(
+            max(top_k * 3, 10),
+            len(self.chunks)
+        )
 
-            hybrid_results.append(
+        keyword_indices = np.argsort(
+            keyword_scores
+        )[::-1][:keyword_candidate_count]
+
+        candidate_indices = (
+            semantic_candidates
+            | {
+                int(index)
+                for index in keyword_indices
+            }
+        )
+
+        if not candidate_indices:
+            return []
+
+        # Build score lookup for semantic results.
+        semantic_score_map = {
+            int(index): float(score)
+            for score, index in zip(
+                semantic_scores,
+                semantic_indices
+            )
+            if index >= 0
+        }
+
+        candidates = []
+
+        for chunk_index in candidate_indices:
+            candidates.append(
                 {
-                    "document": document,
-                    "semantic_score": float(
-                        semantic_score
+                    "chunk_index": chunk_index,
+                    "semantic_score": semantic_score_map.get(
+                        chunk_index,
+                        0.0
                     ),
                     "keyword_score": float(
-                        keyword_score
-                    ),
-                    "hybrid_score": float(
-                        hybrid_score
+                        keyword_scores[chunk_index]
                     )
                 }
             )
 
-        hybrid_results.sort(
-            key=lambda result: result["hybrid_score"],
+        semantic_values = np.array(
+            [
+                item["semantic_score"]
+                for item in candidates
+            ],
+            dtype="float32"
+        )
+
+        keyword_values = np.array(
+            [
+                item["keyword_score"]
+                for item in candidates
+            ],
+            dtype="float32"
+        )
+
+        def normalize(values):
+            minimum = values.min()
+            maximum = values.max()
+
+            if maximum > minimum:
+                return (
+                    (values - minimum)
+                    / (maximum - minimum)
+                )
+
+            # No useful variation in this signal.
+            return np.zeros_like(values)
+
+        semantic_normalized = normalize(
+            semantic_values
+        )
+
+        keyword_normalized = normalize(
+            keyword_values
+        )
+
+        for i, item in enumerate(candidates):
+            item["score"] = (
+                0.7 * semantic_normalized[i]
+                + 0.3 * keyword_normalized[i]
+            )
+
+        candidates.sort(
+            key=lambda item: item["score"],
             reverse=True
         )
 
-        return hybrid_results[:top_k]
+        results = []
+
+        for item in candidates[:top_k]:
+            chunk = self.chunks[item["chunk_index"]]
+
+            results.append(
+                {
+                    "chunk_id": chunk["chunk_id"],
+                    "text": chunk["text"],
+                    "source_file": chunk["source_file"],
+                    "page": chunk.get("page"),
+                    "score": float(item["score"]),
+                    "semantic_score": float(
+                        item["semantic_score"]
+                    ),
+                    "keyword_score": float(
+                        item["keyword_score"]
+                    )
+                }
+            )
+
+        return results
+
+    def save_index(self):
+        if self.index is not None:
+            faiss.write_index(
+                self.index,
+                str(self.index_dir / "documents.faiss")
+            )
+
+        with open(
+            self.index_dir / "chunks.json",
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                self.chunks,
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    def load_index(self):
+        index_path = self.index_dir / "documents.faiss"
+        chunks_path = self.index_dir / "chunks.json"
+
+        if index_path.exists() and chunks_path.exists():
+            self.index = faiss.read_index(
+                str(index_path)
+            )
+
+            with open(
+                chunks_path,
+                "r",
+                encoding="utf-8"
+            ) as file:
+                self.chunks = json.load(file)
+
+            self.rebuild_bm25()
