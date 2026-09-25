@@ -70,6 +70,7 @@ class SearchService:
             dtype="float32"
         )
 
+        # Retrieve enough semantic candidates for hybrid ranking.
         candidate_k = min(
             max(top_k * 3, 10),
             len(self.chunks)
@@ -83,56 +84,101 @@ class SearchService:
         semantic_scores = semantic_scores[0]
         semantic_indices = semantic_indices[0]
 
-        keyword_scores = np.zeros(len(self.chunks))
+        # Calculate BM25 scores for every chunk.
+        keyword_scores = np.zeros(
+            len(self.chunks),
+            dtype="float32"
+        )
 
         if self.bm25 is not None:
-            keyword_scores = self.bm25.get_scores(
-                query.lower().split()
+            keyword_scores = np.asarray(
+                self.bm25.get_scores(
+                    query.lower().split()
+                ),
+                dtype="float32"
             )
+
+        # Use the union of semantic candidates and keyword candidates.
+        semantic_candidates = {
+            int(index)
+            for index in semantic_indices
+            if index >= 0
+        }
+
+        keyword_candidate_count = min(
+            max(top_k * 3, 10),
+            len(self.chunks)
+        )
+
+        keyword_indices = np.argsort(
+            keyword_scores
+        )[::-1][:keyword_candidate_count]
+
+        candidate_indices = (
+            semantic_candidates
+            | {
+                int(index)
+                for index in keyword_indices
+            }
+        )
+
+        if not candidate_indices:
+            return []
+
+        # Build score lookup for semantic results.
+        semantic_score_map = {
+            int(index): float(score)
+            for score, index in zip(
+                semantic_scores,
+                semantic_indices
+            )
+            if index >= 0
+        }
 
         candidates = []
 
-        for position, chunk_index in enumerate(semantic_indices):
-            if chunk_index < 0:
-                continue
-
-            semantic_score = float(
-                semantic_scores[position]
-            )
-
-            keyword_score = float(
-                keyword_scores[chunk_index]
-            )
-
+        for chunk_index in candidate_indices:
             candidates.append(
                 {
-                    "chunk_index": int(chunk_index),
-                    "semantic_score": semantic_score,
-                    "keyword_score": keyword_score
+                    "chunk_index": chunk_index,
+                    "semantic_score": semantic_score_map.get(
+                        chunk_index,
+                        0.0
+                    ),
+                    "keyword_score": float(
+                        keyword_scores[chunk_index]
+                    )
                 }
             )
 
-        if not candidates:
-            return []
-
         semantic_values = np.array(
-            [item["semantic_score"] for item in candidates]
+            [
+                item["semantic_score"]
+                for item in candidates
+            ],
+            dtype="float32"
         )
 
         keyword_values = np.array(
-            [item["keyword_score"] for item in candidates]
+            [
+                item["keyword_score"]
+                for item in candidates
+            ],
+            dtype="float32"
         )
 
         def normalize(values):
             minimum = values.min()
             maximum = values.max()
 
-            if maximum == minimum:
-                return np.ones_like(values)
+            if maximum > minimum:
+                return (
+                    (values - minimum)
+                    / (maximum - minimum)
+                )
 
-            return (values - minimum) / (
-                maximum - minimum
-            )
+            # No useful variation in this signal.
+            return np.zeros_like(values)
 
         semantic_normalized = normalize(
             semantic_values
