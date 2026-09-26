@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 import json
 
 import faiss
@@ -70,7 +70,6 @@ class SearchService:
             dtype="float32"
         )
 
-        # Retrieve enough semantic candidates for hybrid ranking.
         candidate_k = min(
             max(top_k * 3, 10),
             len(self.chunks)
@@ -84,7 +83,16 @@ class SearchService:
         semantic_scores = semantic_scores[0]
         semantic_indices = semantic_indices[0]
 
-        # Calculate BM25 scores for every chunk.
+        # Reject queries whose strongest semantic match is clearly unrelated.
+        # This prevents a very weak match from becoming score 1.0
+        # after min-max normalization.
+        max_semantic_score = float(
+            semantic_scores[0]
+        ) if len(semantic_scores) else 0.0
+
+        if max_semantic_score < 0.20:
+            return []
+
         keyword_scores = np.zeros(
             len(self.chunks),
             dtype="float32"
@@ -98,7 +106,6 @@ class SearchService:
                 dtype="float32"
             )
 
-        # Use the union of semantic candidates and keyword candidates.
         semantic_candidates = {
             int(index)
             for index in semantic_indices
@@ -125,7 +132,6 @@ class SearchService:
         if not candidate_indices:
             return []
 
-        # Build score lookup for semantic results.
         semantic_score_map = {
             int(index): float(score)
             for score, index in zip(
@@ -177,8 +183,7 @@ class SearchService:
                     / (maximum - minimum)
                 )
 
-            # No useful variation in this signal.
-            return np.zeros_like(values)
+            return np.ones_like(values)
 
         semantic_normalized = normalize(
             semantic_values
