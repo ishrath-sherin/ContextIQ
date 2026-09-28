@@ -118,12 +118,13 @@ function App() {
 
       const data = await response.json();
 
-      const chunkCount =
-        data.chunks ??
-        data.chunk_count ??
-        data.num_chunks ??
-        data.total_chunks ??
-        0;
+      const chunkCount = Array.isArray(data.chunks)
+        ? data.chunks.length
+        : data.chunk_count ??
+          data.num_chunks ??
+          data.total_chunks ??
+          data.chunks ??
+          0;
 
       setUploadMessage(
         chunkCount
@@ -461,13 +462,7 @@ function App() {
 
             <div className="mt-6 space-y-4">
               {searchResults.map((result, index) => {
-                const source =
-                  result.source ||
-                  result.filename ||
-                  result.file_name ||
-                  result.metadata?.source ||
-                  result.metadata?.filename ||
-                  "Document";
+                const source = result.source_file || result.filename || result.file_name || result.metadata?.source || result.metadata?.filename || result.source || "Document";
 
                 const passage =
                   result.passage ||
@@ -514,32 +509,32 @@ function App() {
                           />
 
                           <p className="font-semibold text-slate-900">
-                            {source}
+                            {typeof source === "object" ? (source?.name || source?.filename || source?.source_file || "Document") : source}
                           </p>
                         </div>
 
                         <p className="mt-1 text-xs text-slate-400">
-                          Page: {page}
+                          Page: {typeof page === "object" ? (page?.page ?? "-") : page}
                         </p>
                       </div>
 
                       <div className="flex flex-wrap gap-2 text-xs">
                         <span className="rounded-full bg-blue-100 px-3 py-1 font-semibold text-blue-700">
-                          Relevance: {finalScore}
+                          Relevance: {typeof finalScore === "object" ? "-" : finalScore}
                         </span>
 
                         <span className="rounded-full bg-purple-100 px-3 py-1 font-semibold text-purple-700">
-                          Semantic: {semanticScore}
+                          Semantic: {typeof semanticScore === "object" ? "-" : semanticScore}
                         </span>
 
                         <span className="rounded-full bg-emerald-100 px-3 py-1 font-semibold text-emerald-700">
-                          Keyword: {keywordScore}
+                          Keyword: {typeof keywordScore === "object" ? "-" : keywordScore}
                         </span>
                       </div>
                     </div>
 
                     <p className="mt-4 text-sm leading-7 text-slate-600">
-                      {passage}
+                      {typeof passage === "object" ? (passage?.text || passage?.content || "No passage available") : passage}
                     </p>
                   </div>
                 );
@@ -1039,3 +1034,4 @@ function ProcessCard({ number, icon, title, text }) {
 }
 
 export default App;
+
