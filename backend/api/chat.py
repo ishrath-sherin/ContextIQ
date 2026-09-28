@@ -6,12 +6,7 @@ from pydantic import BaseModel, Field
 from api.upload import search_service
 from services.chat_service import OllamaChatService
 
-
-router = APIRouter(
-    prefix="/chat",
-    tags=["Chat"]
-)
-
+router = APIRouter(prefix="/chat", tags=["Chat"])
 
 ollama_service = OllamaChatService()
 
@@ -22,26 +17,10 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(
-        min_length=1,
-        max_length=4000
-    )
-
-    mode: Literal[
-        "auto",
-        "documents",
-        "general"
-    ] = "auto"
-
-    top_k: int = Field(
-        default=5,
-        ge=1,
-        le=10
-    )
-
-    history: list[ChatMessage] = Field(
-        default_factory=list
-    )
+    message: str = Field(min_length=1, max_length=4000)
+    mode: Literal["auto", "documents", "general"] = "auto"
+    top_k: int = Field(default=5, ge=1, le=10)
+    history: list[ChatMessage] = Field(default_factory=list)
 
 
 class ChatSource(BaseModel):
@@ -79,9 +58,9 @@ async def chat(request: ChatRequest):
     ]
 
     try:
-        # --------------------------------------------------------
-        # GENERAL MODE
-        # --------------------------------------------------------
+        # ---------------------------------------------------------
+        # EXPLICIT GENERAL MODE
+        # ---------------------------------------------------------
         if request.mode == "general":
             answer = ollama_service.answer_general(
                 question=question,
@@ -94,23 +73,23 @@ async def chat(request: ChatRequest):
                 sources=[]
             )
 
-        # --------------------------------------------------------
-        # DOCUMENT SEARCH
-        # --------------------------------------------------------
+        # ---------------------------------------------------------
+        # SEARCH UPLOADED DOCUMENTS
+        # ---------------------------------------------------------
         results = search_service.search(
             query=question,
             top_k=request.top_k
         )
 
-        # --------------------------------------------------------
-        # DOCUMENT MODE
-        # --------------------------------------------------------
+        # ---------------------------------------------------------
+        # EXPLICIT DOCUMENT MODE
+        # ---------------------------------------------------------
         if request.mode == "documents":
             if not results:
                 return ChatResponse(
                     answer=(
-                        "I could not find relevant content in "
-                        "the uploaded documents."
+                        "I could not find relevant information "
+                        "in the uploaded documents."
                     ),
                     mode="documents",
                     sources=[]
@@ -131,25 +110,99 @@ async def chat(request: ChatRequest):
                 ]
             )
 
-        # --------------------------------------------------------
+        # ---------------------------------------------------------
         # AUTO MODE
         #
-        # Use document context when the search system finds a
-        # meaningful semantic or keyword match.
-        # --------------------------------------------------------
-        document_results = [
-            result
-            for result in results
-            if (
-                result.get("semantic_score", 0.0) >= 0.35
-                or result.get("keyword_score", 0.0) > 0.0
-            )
-        ]
+        # ContextIQ decides whether the user is asking about the
+        # uploaded documents or asking a general knowledge question.
+        # ---------------------------------------------------------
 
-        if document_results:
+        question_lower = question.lower()
+
+        # Words/phrases that explicitly connect the question
+        # to an uploaded document or a person described in it.
+        document_terms = (
+            "resume",
+            "cv",
+            "curriculum vitae",
+            "uploaded document",
+            "uploaded file",
+            "this document",
+            "the document",
+            "this file",
+            "the file",
+            "according to the document",
+            "according to the resume",
+            "according to the cv",
+            "in the resume",
+            "in the cv",
+            "in the document",
+            "from the resume",
+            "from the cv",
+            "from the document",
+            "listed in",
+            "mentioned in",
+            "mentioned on",
+            "according to",
+            "what does she",
+            "what does he",
+            "what are her",
+            "what are his",
+            "what is her",
+            "what is his",
+            "her experience",
+            "his experience",
+            "her skills",
+            "his skills",
+            "her education",
+            "his education",
+            "her projects",
+            "his projects",
+            "her certifications",
+            "his certifications",
+            "her background",
+            "his background",
+        )
+
+        asks_about_document = any(
+            term in question_lower
+            for term in document_terms
+        )
+
+        # Questions beginning with these phrases are normally
+        # general knowledge questions unless they explicitly
+        # refer to the uploaded document.
+        generic_question_starts = (
+            "what is ",
+            "what are ",
+            "who is ",
+            "who are ",
+            "why is ",
+            "why are ",
+            "how does ",
+            "how do ",
+            "explain ",
+            "define ",
+            "tell me about ",
+        )
+
+        is_generic_question = question_lower.startswith(
+            generic_question_starts
+        )
+
+        # ---------------------------------------------------------
+        # DOCUMENT QUESTION
+        # ---------------------------------------------------------
+        #
+        # Example:
+        # "What skills are listed in the resume?"
+        # "What are her projects?"
+        # "What certifications are mentioned in the CV?"
+        #
+        if results and asks_about_document:
             answer = ollama_service.answer_from_documents(
                 question=question,
-                search_results=document_results,
+                search_results=results,
                 history=history
             )
 
@@ -158,13 +211,70 @@ async def chat(request: ChatRequest):
                 mode="documents",
                 sources=[
                     ChatSource(**result)
-                    for result in document_results
+                    for result in results
                 ]
             )
 
-        # --------------------------------------------------------
-        # FALL BACK TO GENERAL LOCAL AI
-        # --------------------------------------------------------
+        # ---------------------------------------------------------
+        # GENERAL QUESTION
+        # ---------------------------------------------------------
+        #
+        # Example:
+        # "What is AI?"
+        # "What is machine learning?"
+        # "Explain cloud computing."
+        #
+        # Even if an uploaded document happens to mention AI,
+        # these questions should normally be answered generally.
+        #
+        if is_generic_question and not asks_about_document:
+            answer = ollama_service.answer_general(
+                question=question,
+                history=history
+            )
+
+            return ChatResponse(
+                answer=answer,
+                mode="general",
+                sources=[]
+            )
+
+        # ---------------------------------------------------------
+        # OTHER QUESTIONS
+        # ---------------------------------------------------------
+        #
+        # If the question does not clearly look like a generic
+        # knowledge question and relevant document results exist,
+        # use the document context.
+        #
+        # This supports natural questions such as:
+        # "Where did she study?"
+        # "Does she know Python?"
+        # "Tell me about her experience."
+        #
+        if results:
+            answer = ollama_service.answer_from_documents(
+                question=question,
+                search_results=results,
+                history=history
+            )
+
+            return ChatResponse(
+                answer=answer,
+                mode="documents",
+                sources=[
+                    ChatSource(**result)
+                    for result in results
+                ]
+            )
+
+        # ---------------------------------------------------------
+        # NO DOCUMENT RESULTS
+        # ---------------------------------------------------------
+        #
+        # Nothing relevant was found in uploaded documents,
+        # so answer using the local Ollama model.
+        #
         answer = ollama_service.answer_general(
             question=question,
             history=history
